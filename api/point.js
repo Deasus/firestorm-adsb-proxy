@@ -1,20 +1,26 @@
 /**
  * FIRESTORM ADS-B proxy — 5-second cached edge function
  *
- * Sits between the FIRESTORM frontend and airplanes.live. The frontend
- * polls this function every 5s per region; we cache responses for 5s
- * (per-region key) so N UAT users concurrently polling the same region
- * still result in 1 upstream call per 5s. This is what prevents the HTTP
- * 429 rate-limiting we hit when the browser polled airplanes.live directly.
+ * 2026-05-06: PRIMARY is now ADSBx Enterprise (LADD/PIA-immune feeder
+ * network — captures DOI + contracted aircraft that airplanes.live filters
+ * out). API key kept server-side via process.env.ADSBX_API_KEY (Vercel env).
+ * airplanes.live remains as failover #1; adsb.lol as failover #2.
+ *
+ * Sits between the FIRESTORM frontend and ADSBx. The frontend polls this
+ * function every 5s per region; we cache responses for 5s (per-region
+ * key) so N UAT users concurrently polling the same region still result
+ * in 1 upstream call per 5s.
  *
  * Usage: /api/point?lat=40&lng=-115&radius=500
- * Returns: same shape as api.airplanes.live/v2/point (keys: ac, msg, now, total, ctime, ptime)
+ * Returns: same shape as airplanes.live/v2/point (keys: ac, msg, now, total)
  * CORS: Access-Control-Allow-Origin: * so the FIRESTORM HTML can call it.
  */
 
-const PRIMARY = 'https://api.airplanes.live/v2/point';
-const FAILOVER = 'https://api.adsb.lol/v2/point';
+const ADSBX = 'https://adsbexchange.com/api/aircraft/v2';
+const FAILOVER1 = 'https://api.airplanes.live/v2/point';
+const FAILOVER2 = 'https://api.adsb.lol/v2/point';
 const CACHE_TTL_MS = 5000;
+const ADSBX_KEY = process.env.ADSBX_API_KEY || '';
 
 // In-memory cache. Vercel may cold-start between invocations, but when the
 // function is "warm" (last invoked within ~15 min) the module-scope cache
@@ -33,14 +39,18 @@ function cors(res) {
 }
 
 async function fetchUpstream(base, lat, lng, radius) {
-  const url = `${base}/${lat}/${lng}/${radius}`;
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'FIRESTORM-proxy/1.0',
-      Accept: 'application/json',
-    },
-  });
-  return r;
+  // ADSBx uses /lat/{lat}/lon/{lng}/dist/{radius}/ + x-api-key header.
+  // airplanes.live + adsb.lol use /{lat}/{lng}/{radius} positional + no auth.
+  const isAdsbx = base === ADSBX;
+  const url = isAdsbx
+    ? `${base}/lat/${lat}/lon/${lng}/dist/${radius}/`
+    : `${base}/${lat}/${lng}/${radius}`;
+  const headers = {
+    'User-Agent': 'FIRESTORM-proxy/1.1',
+    Accept: 'application/json',
+  };
+  if (isAdsbx && ADSBX_KEY) headers['x-api-key'] = ADSBX_KEY;
+  return fetch(url, { headers });
 }
 
 export default async function handler(req, res) {
@@ -77,55 +87,44 @@ export default async function handler(req, res) {
     return res.status(200).json(cached.data);
   }
 
-  // Upstream fetch. Try primary unless we've been 429'd recently.
-  let base = now < primaryBannedUntil ? FAILOVER : PRIMARY;
-  let usedFailover = base === FAILOVER;
+  // Try upstreams in order. ADSBx first (LADD/PIA-immune, paid), then
+  // airplanes.live (free), then adsb.lol (free, no CORS but server-side OK).
+  // Cool down ADSBx if it 429s (shouldn't on Enterprise, but defensive).
+  const tiers = [
+    { base: ADSBX,     label: 'adsbx',         skip: !ADSBX_KEY || now < primaryBannedUntil },
+    { base: FAILOVER1, label: 'airplanes.live', skip: false },
+    { base: FAILOVER2, label: 'adsb.lol',       skip: false },
+  ];
 
-  try {
-    let r = await fetchUpstream(base, latN, lngN, radiusN);
-
-    // Primary got rate limited — cool it for 5 min + try failover
-    if (r.status === 429 && !usedFailover) {
-      primaryBannedUntil = now + 5 * 60 * 1000;
-      base = FAILOVER;
-      usedFailover = true;
-      r = await fetchUpstream(base, latN, lngN, radiusN);
-    }
-
-    if (!r.ok) {
-      res.setHeader('X-Cache', 'MISS');
-      res.setHeader('X-Upstream', usedFailover ? 'failover' : 'primary');
-      // If we have a stale cache, serve it rather than fail
-      if (cached) {
-        res.setHeader('X-Cache', 'STALE');
-        res.setHeader('X-Cache-Age-Ms', String(now - cached.at));
-        return res.status(200).json(cached.data);
+  let lastErr = null;
+  for (const tier of tiers) {
+    if (tier.skip) continue;
+    try {
+      const r = await fetchUpstream(tier.base, latN, lngN, radiusN);
+      if (r.status === 429 && tier.label === 'adsbx') {
+        primaryBannedUntil = now + 5 * 60 * 1000;
+        continue;
       }
-      return res
-        .status(502)
-        .json({ error: `upstream ${r.status}`, via: usedFailover ? 'failover' : 'primary' });
+      if (!r.ok) { lastErr = `${tier.label} ${r.status}`; continue; }
+      const data = await r.json();
+      cache.set(key, { at: now, data });
+      if (cache.size > 500) {
+        const oldest = [...cache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+        if (oldest) cache.delete(oldest[0]);
+      }
+      res.setHeader('X-Cache', 'MISS');
+      res.setHeader('X-Upstream', tier.label);
+      return res.status(200).json(data);
+    } catch (e) {
+      lastErr = `${tier.label} ${e.message}`;
     }
-
-    const data = await r.json();
-    cache.set(key, { at: now, data });
-
-    // Opportunistic memory cap so the map doesn't grow forever. Cache entries
-    // for rarely-requested (lat,lng,radius) combos expire by LRU (roughly).
-    if (cache.size > 500) {
-      const oldest = [...cache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
-      if (oldest) cache.delete(oldest[0]);
-    }
-
-    res.setHeader('X-Cache', 'MISS');
-    res.setHeader('X-Upstream', usedFailover ? 'failover' : 'primary');
-    return res.status(200).json(data);
-  } catch (e) {
-    // Network/DNS failure — if we have ANY cached data for this region, serve it
-    if (cached) {
-      res.setHeader('X-Cache', 'STALE');
-      res.setHeader('X-Cache-Age-Ms', String(now - cached.at));
-      return res.status(200).json(cached.data);
-    }
-    return res.status(502).json({ error: `proxy failed: ${e.message}` });
   }
+
+  // All upstreams failed — serve stale if we have it.
+  if (cached) {
+    res.setHeader('X-Cache', 'STALE');
+    res.setHeader('X-Cache-Age-Ms', String(now - cached.at));
+    return res.status(200).json(cached.data);
+  }
+  return res.status(502).json({ error: `all upstreams failed: ${lastErr}` });
 }
