@@ -1,13 +1,16 @@
 /**
  * FIRESTORM ADS-B proxy — 5-second cached edge function
  *
- * 2026-05-06: PRIMARY is now ADSBx Enterprise (LADD/PIA-immune feeder
- * network — captures DOI + contracted aircraft that airplanes.live filters
- * out). API key kept server-side via process.env.ADSBX_API_KEY (Vercel env).
- * airplanes.live remains as failover #1; adsb.lol as failover #2.
+ * 2026-05-29: cascade is ADSBx (paid, when key set) → airplanes.live →
+ * adsb.fi → adsb.lol. Three independent free sources behind ADSBx so a
+ * single upstream's outage / rate-limit / outage never reaches the operator.
+ * Per-tier in-memory cool-down (30s) skips a source that 429s/5xxs/times
+ * out, so the next request doesn't re-burn budget on a known-bad upstream.
+ * Per-call timeout (3s via AbortController) so a hung upstream can't eat
+ * the whole 10s function budget.
  *
- * Sits between the FIRESTORM frontend and ADSBx. The frontend polls this
- * function every 5s per region; we cache responses for 5s (per-region
+ * Sits between the FIRESTORM frontend and the upstreams. The frontend polls
+ * this function every 5s per region; we cache responses for 5s (per-region
  * key) so N UAT users concurrently polling the same region still result
  * in 1 upstream call per 5s.
  *
@@ -17,9 +20,12 @@
  */
 
 const ADSBX = 'https://adsbexchange.com/api/aircraft/v2';
-const FAILOVER1 = 'https://api.airplanes.live/v2/point';
-const FAILOVER2 = 'https://api.adsb.lol/v2/point';
+const AIRPLANES_LIVE = 'https://api.airplanes.live/v2/point';
+const ADSB_FI = 'https://opendata.adsb.fi/api/v3';            // /lat/{lat}/lon/{lng}/dist/{r}
+const ADSB_LOL = 'https://api.adsb.lol/v2/point';
 const CACHE_TTL_MS = 5000;
+const UPSTREAM_TIMEOUT_MS = 3000;
+const COOLDOWN_MS = 30 * 1000;
 const ADSBX_KEY = process.env.ADSBX_API_KEY || '';
 
 // In-memory cache. Vercel may cold-start between invocations, but when the
@@ -28,9 +34,12 @@ const ADSBX_KEY = process.env.ADSBX_API_KEY || '';
 // the steady state, so 5s cache is effective.
 const cache = new Map();
 
-// Brief a 429 from primary so we don't hammer it. Vercel region isolation
-// means this state is per-datacenter; fine for this use case.
-let primaryBannedUntil = 0;
+// Per-tier cool-down. If a source 429s / 5xxs / times out, we skip it for
+// COOLDOWN_MS so subsequent requests don't burn budget on a known-bad
+// upstream. State is per-Vercel-instance, so other warm instances probe
+// independently — that's actually useful (sloppy isolation = some
+// instances retry while others avoid, which surfaces recovery quickly).
+const tierBannedUntil = { adsbx: 0, airplaneslive: 0, adsbfi: 0, adsblol: 0 };
 
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -39,18 +48,39 @@ function cors(res) {
 }
 
 async function fetchUpstream(base, lat, lng, radius) {
-  // ADSBx uses /lat/{lat}/lon/{lng}/dist/{radius}/ + x-api-key header.
-  // airplanes.live + adsb.lol use /{lat}/{lng}/{radius} positional + no auth.
-  const isAdsbx = base === ADSBX;
-  const url = isAdsbx
-    ? `${base}/lat/${lat}/lon/${lng}/dist/${radius}/`
-    : `${base}/${lat}/${lng}/${radius}`;
+  // Three URL shapes + per-source radius caps:
+  //   ADSBx: /lat/{lat}/lon/{lng}/dist/{r}/ + x-api-key. Accepts up to 500nm.
+  //   adsb.fi (v3): /lat/{lat}/lon/{lng}/dist/{r}. Caps at 250nm — over-limit
+  //     returns 400. Clamp on the way in so the fallback still serves.
+  //   airplanes.live: /{lat}/{lng}/{r} positional, no key. Caps at 250nm —
+  //     over-limit returns 403 (not 400, hence the spurious "Forbidden"
+  //     diagnosis until 2026-05-29). Clamp.
+  //   adsb.lol: /{lat}/{lng}/{r} positional, tolerates 500nm in practice.
+  let url;
+  if (base === ADSBX) {
+    url = `${base}/lat/${lat}/lon/${lng}/dist/${radius}/`;
+  } else if (base === ADSB_FI) {
+    const r = Math.min(radius, 250);
+    url = `${base}/lat/${lat}/lon/${lng}/dist/${r}`;
+  } else if (base === AIRPLANES_LIVE) {
+    const r = Math.min(radius, 250);
+    url = `${base}/${lat}/${lng}/${r}`;
+  } else {
+    url = `${base}/${lat}/${lng}/${radius}`;
+  }
   const headers = {
-    'User-Agent': 'FIRESTORM-proxy/1.1',
+    'User-Agent': 'FIRESTORM-proxy/1.2',
     Accept: 'application/json',
   };
-  if (isAdsbx && ADSBX_KEY) headers['x-api-key'] = ADSBX_KEY;
-  return fetch(url, { headers });
+  if (base === ADSBX && ADSBX_KEY) headers['x-api-key'] = ADSBX_KEY;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    return await fetch(url, { headers, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export default async function handler(req, res) {
@@ -87,13 +117,14 @@ export default async function handler(req, res) {
     return res.status(200).json(cached.data);
   }
 
-  // Try upstreams in order. ADSBx first (LADD/PIA-immune, paid), then
-  // airplanes.live (free), then adsb.lol (free, no CORS but server-side OK).
-  // Cool down ADSBx if it 429s (shouldn't on Enterprise, but defensive).
+  // Try upstreams in order. ADSBx first (LADD/PIA-immune, paid + licensed),
+  // then three independent free sources. Skip any tier that's in cool-down.
+  // ADSBx tier additionally skipped when key isn't configured.
   const tiers = [
-    { base: ADSBX,     label: 'adsbx',         skip: !ADSBX_KEY || now < primaryBannedUntil },
-    { base: FAILOVER1, label: 'airplanes.live', skip: false },
-    { base: FAILOVER2, label: 'adsb.lol',       skip: false },
+    { base: ADSBX,          label: 'adsbx',          key: 'adsbx',          skip: !ADSBX_KEY || now < tierBannedUntil.adsbx },
+    { base: AIRPLANES_LIVE, label: 'airplanes.live', key: 'airplaneslive',  skip: now < tierBannedUntil.airplaneslive },
+    { base: ADSB_FI,        label: 'adsb.fi',        key: 'adsbfi',         skip: now < tierBannedUntil.adsbfi },
+    { base: ADSB_LOL,       label: 'adsb.lol',       key: 'adsblol',        skip: now < tierBannedUntil.adsblol },
   ];
 
   let lastErr = null;
@@ -101,8 +132,9 @@ export default async function handler(req, res) {
     if (tier.skip) continue;
     try {
       const r = await fetchUpstream(tier.base, latN, lngN, radiusN);
-      if (r.status === 429 && tier.label === 'adsbx') {
-        primaryBannedUntil = now + 5 * 60 * 1000;
+      if (r.status === 429 || r.status >= 500) {
+        tierBannedUntil[tier.key] = now + COOLDOWN_MS;
+        lastErr = `${tier.label} ${r.status}`;
         continue;
       }
       if (!r.ok) { lastErr = `${tier.label} ${r.status}`; continue; }
@@ -116,7 +148,9 @@ export default async function handler(req, res) {
       res.setHeader('X-Upstream', tier.label);
       return res.status(200).json(data);
     } catch (e) {
-      lastErr = `${tier.label} ${e.message}`;
+      // AbortError (timeout) and network errors both fall here — cool down.
+      tierBannedUntil[tier.key] = now + COOLDOWN_MS;
+      lastErr = `${tier.label} ${e.message || e.name}`;
     }
   }
 

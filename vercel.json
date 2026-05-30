@@ -1,8 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "api/point.js": {
-      "maxDuration": 10
-    }
+    "api/point.js": { "maxDuration": 15 },
+    "api/mil.js":   { "maxDuration": 20 },
+    "api/ladd.js":  { "maxDuration": 25 },
+    "api/pia.js":   { "maxDuration": 20 }
   }
 }
