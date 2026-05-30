@@ -1,9 +1,14 @@
 /**
  * FIRESTORM ADS-B proxy — 5-second cached edge function
  *
- * 2026-05-29: cascade is ADSBx (paid, when key set) → airplanes.live →
- * adsb.fi → adsb.lol. Three independent free sources behind ADSBx so a
- * single upstream's outage / rate-limit / outage never reaches the operator.
+ * 2026-05-29: cascade is ADSBx (paid, when key set) → adsb.lol →
+ * airplanes.live → adsb.fi. Three independent free sources behind ADSBx so
+ * a single upstream's outage / rate-limit / outage never reaches the operator.
+ * adsb.lol is preferred over airplanes.live / adsb.fi because it's the only
+ * free source that honors the full 500nm /point radius (the others silently
+ * clamp to 250nm — caught 2026-05-29 when ADSBx 402 exposed visible gaps
+ * between regional disks). When ADSBx is healthy, adsb.lol's slot is
+ * irrelevant; when ADSBx is out, this ordering keeps full-area coverage.
  * Per-tier in-memory cool-down (30s) skips a source that 429s/5xxs/times
  * out, so the next request doesn't re-burn budget on a known-bad upstream.
  * Per-call timeout (3s via AbortController) so a hung upstream can't eat
@@ -117,14 +122,19 @@ export default async function handler(req, res) {
     return res.status(200).json(cached.data);
   }
 
-  // Try upstreams in order. ADSBx first (LADD/PIA-immune, paid + licensed),
-  // then three independent free sources. Skip any tier that's in cool-down.
-  // ADSBx tier additionally skipped when key isn't configured.
+  // Try upstreams in order. ADSBx first (LADD/PIA-immune, paid + licensed,
+  // honors 500nm). Then adsb.lol — also honors full 500nm and is the only
+  // free source that does, which matters when ADSBx is on outage (2026-05-29
+  // 402 billing block exposed this: airplanes.live + adsb.fi both silently
+  // cap /point at 250nm, so disks shrink to ~28% area and the operator sees
+  // visible gaps between regional polls). adsb.lol moved ahead of
+  // airplanes.live + adsb.fi because of that. Skip any tier in cool-down.
+  // ADSBx additionally skipped when key isn't configured.
   const tiers = [
     { base: ADSBX,          label: 'adsbx',          key: 'adsbx',          skip: !ADSBX_KEY || now < tierBannedUntil.adsbx },
+    { base: ADSB_LOL,       label: 'adsb.lol',       key: 'adsblol',        skip: now < tierBannedUntil.adsblol },
     { base: AIRPLANES_LIVE, label: 'airplanes.live', key: 'airplaneslive',  skip: now < tierBannedUntil.airplaneslive },
     { base: ADSB_FI,        label: 'adsb.fi',        key: 'adsbfi',         skip: now < tierBannedUntil.adsbfi },
-    { base: ADSB_LOL,       label: 'adsb.lol',       key: 'adsblol',        skip: now < tierBannedUntil.adsblol },
   ];
 
   let lastErr = null;
