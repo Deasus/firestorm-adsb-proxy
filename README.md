@@ -1,6 +1,6 @@
 # firestorm-adsb-proxy
 
-5-second cached ADS-B proxy for [FIRESTORM](https://github.com/Deasus/Firestorm).
+5-second cached ADS-B proxy for [FIRESTORM](https://github.com/Deasus/firestorm-platform).
 
 ## Why
 
