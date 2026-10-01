@@ -4,6 +4,6 @@
   "description": "Live ADS-B proxy for FIRESTORM — 5s-cached Vercel serverless function in front of airplanes.live + adsb.lol",
   "private": true,
   "engines": {
-    "node": "20.x"
+    "node": "22.x"
   }
 }
